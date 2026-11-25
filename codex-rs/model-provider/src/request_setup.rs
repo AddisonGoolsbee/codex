@@ -12,19 +12,77 @@ use codex_api::Provider;
 use codex_api::ReqwestTransport;
 use codex_api::SharedAuthProvider;
 use codex_features::RuntimeAuthMode;
+use codex_http_client::BuildRouteAwareHttpClientError;
 use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClient;
 use codex_http_client::HttpClientFactory;
 use codex_login::AuthManager;
 use codex_login::AuthOwner;
 use codex_login::CodexAuth;
 use codex_login::default_client::ClientRedirectPolicy;
 use codex_login::default_client::create_client_for_route;
+use codex_login::default_client::default_headers;
 use codex_model_provider_info::GatewayOAuthConfig;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::error::Result;
 use codex_runtime_agent_instance::RuntimeAuth;
 use codex_runtime_agent_instance::RuntimeAuthManager;
+use http::HeaderMap;
 use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::Mutex;
+use std::sync::PoisonError;
+use std::time::Duration;
+use std::time::Instant;
+
+/// A rebuilt client never reuses the previous client's connections, so model requests share one
+/// while every input to building it is unchanged. Entries expire on the same schedule as cached
+/// system proxy decisions, so a reused client is never staler than the route it was built for.
+const MODEL_CLIENT_TTL: Duration = Duration::from_secs(60);
+const MAX_MODEL_CLIENTS: usize = 16;
+
+#[derive(PartialEq)]
+struct ModelClientKey {
+    http_client_factory: HttpClientFactory,
+    request_url: String,
+    redirect_policy: ClientRedirectPolicy,
+    default_headers: HeaderMap,
+}
+
+static MODEL_CLIENTS: LazyLock<Mutex<Vec<(ModelClientKey, Instant, HttpClient)>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+fn model_client(
+    http_client_factory: &HttpClientFactory,
+    request_url: String,
+    redirect_policy: ClientRedirectPolicy,
+) -> std::result::Result<HttpClient, BuildRouteAwareHttpClientError> {
+    let key = ModelClientKey {
+        http_client_factory: http_client_factory.clone(),
+        request_url,
+        redirect_policy,
+        default_headers: default_headers(),
+    };
+    {
+        let mut clients = MODEL_CLIENTS.lock().unwrap_or_else(PoisonError::into_inner);
+        clients.retain(|(_, built_at, _)| built_at.elapsed() < MODEL_CLIENT_TTL);
+        if let Some((_, _, client)) = clients.iter().find(|(cached, _, _)| *cached == key) {
+            return Ok(client.clone());
+        }
+    }
+    let client = create_client_for_route(
+        http_client_factory,
+        &key.request_url,
+        ClientRouteClass::Api,
+        redirect_policy,
+    )?;
+    let mut clients = MODEL_CLIENTS.lock().unwrap_or_else(PoisonError::into_inner);
+    if clients.len() >= MAX_MODEL_CLIENTS {
+        clients.remove(0);
+    }
+    clients.push((key, Instant::now(), client.clone()));
+    Ok(client)
+}
 
 /// Select auth for inference and discovery, letting rotating credentials finish saving
 /// if the requesting operation is cancelled.
@@ -122,13 +180,8 @@ impl ResolvedProviderRequest {
             self.redirect_policy
         };
         let request_url = self.api_provider.url_for_path(endpoint);
-        let client = create_client_for_route(
-            &self.http_client_factory,
-            &request_url,
-            ClientRouteClass::Api,
-            redirect_policy,
-        )
-        .map_err(std::io::Error::from)?;
+        let client = model_client(&self.http_client_factory, request_url, redirect_policy)
+            .map_err(std::io::Error::from)?;
         Ok(ReqwestTransport::from_http_client(client))
     }
 }
@@ -207,3 +260,7 @@ pub async fn resolve_request(
     })
     .await
 }
+
+#[cfg(test)]
+#[path = "request_setup_tests.rs"]
+mod request_setup_tests;
